@@ -1,0 +1,40 @@
+[tool.poetry]
+name = "geotiff-to-tak-terrain"
+version = "0.1.0"
+description = "Convert GeoTIFF DEM to TAK LCLL Terrain Tiles (Mapbox RGB + tAKa metadata)"
+authors = ["Stefan Gofferje <stefan@gofferje.net>"]
+readme = "README.md"
+packages = [{include = "geotiff_to_tak_terrain", from = "src"}]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+numpy = "^1.26.0"
+Pillow = "^10.0.0"
+pypng = "^0.20220715.0"
+gdal = "3.8.4"
+
+[tool.poetry.group.dev.dependencies]
+black = "^23.9.1"
+mypy = "^1.5.1"
+pylint = "^3.0.1"
+pre-commit = "^4.5.1"
+
+[tool.poetry.scripts]
+geotiff-to-tak-terrain = "geotiff_to_tak_terrain.main:main"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 100
+target-version = ['py310']
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+ignore_missing_imports = true
+
+[tool.pylint.messages_control]
+disable = ["C0114", "C0115", "C0116", "too-many-locals"]
+max-line-length = 100

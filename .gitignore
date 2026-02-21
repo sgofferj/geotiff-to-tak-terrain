@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# TAK Security
+certs/
+*.pem
+*.key
+*.pfx
+*.crt
+*.p12
+.env
+
+# Build
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
