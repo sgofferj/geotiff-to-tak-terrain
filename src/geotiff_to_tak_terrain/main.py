@@ -41,11 +41,30 @@ TILE_SIZE = 256
 _worker_ds: Optional[gdal.Dataset] = None
 
 
-def worker_init(vrt_path: str) -> None:
+def get_vrt(input_path: str) -> gdal.Dataset:
+    """Create an in-memory VRT from the input path."""
+    if os.path.isdir(input_path):
+        files = [
+            os.path.join(input_path, f)
+            for f in os.listdir(input_path)
+            if f.lower().endswith((".tif", ".tiff"))
+        ]
+        files.sort()  # Ensure deterministic order
+    else:
+        files = [input_path]
+
+    if not files:
+        raise ValueError("No input files found.")
+
+    vrt_ds = gdal.BuildVRT("", files)
+    return gdal.Warp("", vrt_ds, format="VRT", dstSRS="EPSG:4326")
+
+
+def worker_init(input_path: str) -> None:
     """Initialize worker process by opening the GDAL dataset."""
     global _worker_ds  # pylint: disable=global-statement
     gdal.UseExceptions()
-    _worker_ds = gdal.Open(vrt_path)
+    _worker_ds = get_vrt(input_path)
 
 
 def worker_task(args: Tuple[int, int, int, str, Dict[str, Any]]) -> bool:
@@ -53,6 +72,13 @@ def worker_task(args: Tuple[int, int, int, str, Dict[str, Any]]) -> bool:
     z, tx, ty, dest_dir, meta_params = args
     if _worker_ds is None:
         return False
+
+    skip_existing = meta_params.get("skip_existing", True)
+    if skip_existing:
+        tile_path = os.path.join(dest_dir, str(z), str(tx), f"{ty}.png")
+        if os.path.exists(tile_path):
+            return True
+
     worker_pid = multiprocessing.current_process().pid
     logger.info("Worker[%d]: Processing tile %d/%d/%d", worker_pid, z, tx, ty)
     return process_tile(_worker_ds, (z, tx, ty), dest_dir, meta_params)
@@ -154,29 +180,7 @@ def process_tile(  # pylint: disable=too-many-branches,too-many-statements
 
 def get_input_dataset(input_path: str) -> Tuple[gdal.Dataset, Tuple[float, float, float, float]]:
     """Open input GeoTIFF(s) and return the dataset and its geographic extent."""
-    if os.path.isdir(input_path):
-        files = [
-            os.path.join(input_path, f)
-            for f in os.listdir(input_path)
-            if f.lower().endswith((".tif", ".tiff"))
-        ]
-    else:
-        files = [input_path]
-
-    if not files:
-        raise ValueError("No input files found.")
-
-    logger.info("Found %d files. Opening...", len(files))
-
-    # Use VRT to merge multiple files if necessary
-    vrt_path = "/tmp/input.vrt"
-    gdal.BuildVRT(vrt_path, files)
-    ds = gdal.Open(vrt_path)
-
-    # Get extent in EPSG:4326
-    warp_vrt = "/tmp/extent.vrt"
-    gdal.Warp(warp_vrt, ds, format="VRT", dstSRS="EPSG:4326")
-    wds = gdal.Open(warp_vrt)
+    wds = get_vrt(input_path)
     gt = wds.GetGeoTransform()
 
     # gt: (ulx, xres, xskew, uly, yskew, yres)
@@ -184,11 +188,16 @@ def get_input_dataset(input_path: str) -> Tuple[gdal.Dataset, Tuple[float, float
     return wds, extent
 
 
-def generate_config(
-    output_dir: str, title: str, max_zoom: int, data_source: str, heights: str
+def generate_config(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    output_dir: str,
+    title: str,
+    max_zoom: int,
+    data_source: str,
+    heights: str,
+    extent: Optional[Tuple[float, float, float, float]] = None,
 ) -> None:
     """Generate the config.json for ATAK Map Source."""
-    config = {
+    config: Dict[str, Any] = {
         "schema": "2.1.0",
         "title": title,
         "content": "terrain",
@@ -211,6 +220,16 @@ def generate_config(
         ],
         "metadata": {"heights": heights, "dataSource": data_source},
     }
+
+    if extent:
+        # extent: (min_lon, min_lat, max_lon, max_lat)
+        config["bounds"] = {
+            "minLon": extent[0],
+            "minLat": extent[1],
+            "maxLon": extent[2],
+            "maxLat": extent[3],
+        }
+
     with open(os.path.join(output_dir, "config.json"), "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
 
@@ -224,6 +243,12 @@ def main() -> None:
     parser.add_argument("--max-zoom", type=int, default=14, help="Max zoom level")
     parser.add_argument("--data-source", default="Local DEM", help="Data source name")
     parser.add_argument("--heights", choices=["hae", "msl"], default="hae", help="Height datum")
+    parser.add_argument(
+        "--skip-existing", action="store_true", default=True, help="Skip already existing tiles"
+    )
+    parser.add_argument(
+        "--no-skip", action="store_false", dest="skip_existing", help="Do not skip existing tiles"
+    )
 
     parser.add_argument(
         "--workers", type=int, help="Number of worker processes (default: CPU count)"
@@ -237,8 +262,11 @@ def main() -> None:
         _, extent = get_input_dataset(args.input)
         logger.info("Dataset extent (WGS84): %s", extent)
 
-        meta_params = {"heights_type": heights_type, "data_source": args.data_source}
-        warp_vrt_path = "/tmp/extent.vrt"
+        meta_params = {
+            "heights_type": heights_type,
+            "data_source": args.data_source,
+            "skip_existing": args.skip_existing,
+        }
 
         cpu_count = os.cpu_count() or 1
         num_workers = args.workers or max(1, min(8, cpu_count // 2))
@@ -247,15 +275,15 @@ def main() -> None:
         with multiprocessing.Pool(
             processes=num_workers,
             initializer=worker_init,
-            initargs=(warp_vrt_path,),
+            initargs=(args.input,),
             maxtasksperchild=50,
         ) as pool:
             for z in range(args.min_zoom, args.max_zoom + 1):
                 count = 0
                 if z == 0:
-                    tile_iter = [(0, 0), (1, 0)]
+                    tile_iter = iter([(0, 0), (1, 0)])
                 else:
-                    tile_iter = list(get_intersecting_tiles(extent, z))
+                    tile_iter = get_intersecting_tiles(extent, z)
 
                 # Prepare arguments for the pool
                 tasks = ((z, tx, ty, args.output, meta_params) for tx, ty in tile_iter)
@@ -266,7 +294,9 @@ def main() -> None:
                 if count > 0:
                     logger.info("Level %d: Generated %d tiles", z, count)
 
-        generate_config(args.output, args.title, args.max_zoom, args.data_source, args.heights)
+        generate_config(
+            args.output, args.title, args.max_zoom, args.data_source, args.heights, extent
+        )
         logger.info("Done!")
 
     except (RuntimeError, ValueError) as e:
