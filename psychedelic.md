@@ -2,6 +2,9 @@
 
 If you open one of these Terrain-RGB tiles in a standard image viewer, you'll see a psychedelic "glitch" of colors instead of a normal grayscale elevation map. This is by design!
 
+![Example of a Terrain-RGB tile](images/example_tile.png)
+*An example Terrain-RGB tile showing the psychedelic gradients caused by 24-bit elevation packing.*
+
 ### The 24-bit Packing Trick
 Standard 8-bit grayscale images only have 256 levels (0–255). If 1 unit = 1 meter, you could only represent a mountain 256 meters high. To cover the entire planet with **centimeter precision**, the elevation is "spread" across the **Red, Green, and Blue** channels of a 24-bit PNG.
 
