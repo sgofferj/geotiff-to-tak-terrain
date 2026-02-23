@@ -1,6 +1,6 @@
 # GeoTIFF to TAK LCLL Terrain Converter
 
-Convert Digital Elevation Model (DEM) GeoTIFFs into the **LCLL (Low Complexity Low Latency)** terrain format used by TAK (ATAK, WinTAK, CloudTAK).
+Convert Digital Elevation Model (DEM) GeoTIFFs into the **LCLL (Low Complexity Low Latency)** terrain format used by TAK (ATAK, WinTAK).
 
 ## Format Details
 - **Tiling Scheme**: EPSG:4326 (Geographic) Slippy/Google (Root Level 0 = 2 tiles).
