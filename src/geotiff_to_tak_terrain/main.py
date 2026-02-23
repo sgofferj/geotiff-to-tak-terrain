@@ -19,7 +19,8 @@ import json
 import logging
 import argparse
 import io
-from typing import Tuple, Dict
+import multiprocessing
+from typing import Tuple, Dict, Any, Optional
 import numpy as np
 from osgeo import gdal
 import png  # pypng for custom chunk support
@@ -36,8 +37,28 @@ gdal.UseExceptions()
 
 TILE_SIZE = 256
 
+# Global for worker processes
+_worker_ds: Optional[gdal.Dataset] = None
 
-def process_tile(
+
+def worker_init(vrt_path: str) -> None:
+    """Initialize worker process by opening the GDAL dataset."""
+    global _worker_ds  # pylint: disable=global-statement
+    gdal.UseExceptions()
+    _worker_ds = gdal.Open(vrt_path)
+
+
+def worker_task(args: Tuple[int, int, int, str, Dict[str, Any]]) -> bool:
+    """Worker task to process a single tile."""
+    z, tx, ty, dest_dir, meta_params = args
+    if _worker_ds is None:
+        return False
+    worker_pid = multiprocessing.current_process().pid
+    logger.info("Worker[%d]: Processing tile %d/%d/%d", worker_pid, z, tx, ty)
+    return process_tile(_worker_ds, (z, tx, ty), dest_dir, meta_params)
+
+
+def process_tile(  # pylint: disable=too-many-branches,too-many-statements
     ds: gdal.Dataset,
     tile_coord: Tuple[int, int, int],
     dest_dir: str,
@@ -51,35 +72,52 @@ def process_tile(
 
     try:
         # Warp to tile extent
-        out_ds = gdal.Warp(
-            "",
-            ds,
-            format="MEM",
-            outputBounds=[bounds[0], bounds[1], bounds[2], bounds[3]],
-            width=TILE_SIZE,
-            height=TILE_SIZE,
-            dstSRS="EPSG:4326",
-            resampleAlg=gdal.GRA_Bilinear,
-        )
+        try:
+            out_ds = gdal.Warp(
+                "",
+                ds,
+                format="MEM",
+                outputBounds=[bounds[0], bounds[1], bounds[2], bounds[3]],
+                width=TILE_SIZE,
+                height=TILE_SIZE,
+                dstSRS="EPSG:4326",
+                resampleAlg=gdal.GRA_Bilinear,
+            )
+        except RuntimeError:
+            if z == 0:
+                out_ds = None
+            else:
+                raise
 
-        data = out_ds.ReadAsArray()
-        if data is None:
-            return False
+        if out_ds is None:
+            if z == 0:
+                data = np.full((TILE_SIZE, TILE_SIZE), -10000.0, dtype=np.float32)
+                mask = np.zeros((TILE_SIZE, TILE_SIZE), dtype=np.uint8)
+            else:
+                return False
+        else:
+            # Check if tile has data
+            band = out_ds.GetRasterBand(1)
+            data = band.ReadAsArray()
+            if data is None:
+                if z == 0:
+                    data = np.full((TILE_SIZE, TILE_SIZE), -10000.0, dtype=np.float32)
+                    mask = np.zeros((TILE_SIZE, TILE_SIZE), dtype=np.uint8)
+                else:
+                    return False
+            else:
+                nodata = band.GetNoDataValue()
+                if nodata is None:
+                    nodata = -9999
 
-        # Check if tile has data
-        band = out_ds.GetRasterBand(1)
-        nodata = band.GetNoDataValue()
-        if nodata is None:
-            nodata = -9999
-
-        mask = (data > nodata).astype(np.uint8) * 255
-        if np.max(mask) == 0:
-            return False
+                mask = (data > nodata).astype(np.uint8) * 255
+                if np.max(mask) == 0 and z > 0:
+                    return False
 
         # Encode RGB
         rgb = encode_terrain_rgb(data)
         rgba = np.dstack((rgb, mask))
-        rgba_flat = rgba.reshape(TILE_SIZE, TILE_SIZE * 4)
+        rgba_flat = rgba.reshape(TILE_SIZE, -1)
 
         # Prepare metadata chunk
         metadata = {
@@ -93,7 +131,9 @@ def process_tile(
         # Save using pypng to inject chunk
         os.makedirs(tile_dir, exist_ok=True)
         with open(tile_path, "wb") as f:
-            w = png.Writer(width=TILE_SIZE, height=TILE_SIZE, alpha=True, bitdepth=8)
+            w = png.Writer(
+                width=TILE_SIZE, height=TILE_SIZE, alpha=True, bitdepth=8, greyscale=False
+            )
             buf = io.BytesIO()
             w.write(buf, rgba_flat)
             png_data = buf.getvalue()
@@ -185,23 +225,46 @@ def main() -> None:
     parser.add_argument("--data-source", default="Local DEM", help="Data source name")
     parser.add_argument("--heights", choices=["hae", "msl"], default="hae", help="Height datum")
 
+    parser.add_argument(
+        "--workers", type=int, help="Number of worker processes (default: CPU count)"
+    )
+
     args = parser.parse_args()
 
     heights_type = "ellipsoidal" if args.heights == "hae" else "orthometric"
 
     try:
-        ds, extent = get_input_dataset(args.input)
+        _, extent = get_input_dataset(args.input)
         logger.info("Dataset extent (WGS84): %s", extent)
 
         meta_params = {"heights_type": heights_type, "data_source": args.data_source}
+        warp_vrt_path = "/tmp/extent.vrt"
 
-        for z in range(args.min_zoom, args.max_zoom + 1):
-            count = 0
-            for tx, ty in get_intersecting_tiles(extent, z):
-                if process_tile(ds, (z, tx, ty), args.output, meta_params):
-                    count += 1
-            if count > 0:
-                logger.info("Level %d: Generated %d tiles", z, count)
+        cpu_count = os.cpu_count() or 1
+        num_workers = args.workers or max(1, min(8, cpu_count // 2))
+        logger.info("Using %d worker processes", num_workers)
+
+        with multiprocessing.Pool(
+            processes=num_workers,
+            initializer=worker_init,
+            initargs=(warp_vrt_path,),
+            maxtasksperchild=50,
+        ) as pool:
+            for z in range(args.min_zoom, args.max_zoom + 1):
+                count = 0
+                if z == 0:
+                    tile_iter = [(0, 0), (1, 0)]
+                else:
+                    tile_iter = list(get_intersecting_tiles(extent, z))
+
+                # Prepare arguments for the pool
+                tasks = ((z, tx, ty, args.output, meta_params) for tx, ty in tile_iter)
+
+                for result in pool.imap_unordered(worker_task, tasks, chunksize=1):
+                    if result:
+                        count += 1
+                if count > 0:
+                    logger.info("Level %d: Generated %d tiles", z, count)
 
         generate_config(args.output, args.title, args.max_zoom, args.data_source, args.heights)
         logger.info("Done!")
