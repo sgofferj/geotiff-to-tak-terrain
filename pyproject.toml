@@ -11,7 +11,7 @@ python = "^3.10"
 numpy = "^1.26.0"
 Pillow = "^10.0.0"
 pypng = "^0.20220715.0"
-gdal = "3.8.4"
+gdal = "3.10.3"
 
 [tool.poetry.group.dev.dependencies]
 black = "^23.9.1"

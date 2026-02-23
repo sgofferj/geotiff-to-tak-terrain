@@ -26,4 +26,6 @@ build/
 .vscode/
 .idea/
 GEMINI.md
+
+# Logs
 *.log
