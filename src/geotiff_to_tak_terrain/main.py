@@ -158,7 +158,12 @@ def process_tile(  # pylint: disable=too-many-branches,too-many-statements
         os.makedirs(tile_dir, exist_ok=True)
         with open(tile_path, "wb") as f:
             w = png.Writer(
-                width=TILE_SIZE, height=TILE_SIZE, alpha=True, bitdepth=8, greyscale=False
+                width=TILE_SIZE,
+                height=TILE_SIZE,
+                alpha=True,
+                bitdepth=8,
+                greyscale=False,
+                compression=meta_params.get("compression", 6),
             )
             buf = io.BytesIO()
             w.write(buf, rgba_flat)
@@ -188,15 +193,63 @@ def get_input_dataset(input_path: str) -> Tuple[gdal.Dataset, Tuple[float, float
     return wds, extent
 
 
-def generate_config(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+def get_rendered_metadata(
+    output_dir: str,
+) -> Tuple[int, Optional[Tuple[float, float, float, float]]]:
+    """Discover max zoom and geographic extent from rendered tiles on disk."""
+    max_z = -1
+    overall_extent = None
+
+    if not os.path.exists(output_dir):
+        return max_z, None
+
+    for z_str in os.listdir(output_dir):
+        if not z_str.isdigit():
+            continue
+        z = int(z_str)
+        max_z = max(max_z, z)
+
+        z_dir = os.path.join(output_dir, z_str)
+        for x_str in os.listdir(z_dir):
+            if not x_str.isdigit():
+                continue
+            tx = int(x_str)
+            x_dir = os.path.join(z_dir, x_str)
+            for y_file in os.listdir(x_dir):
+                if not y_file.endswith(".png"):
+                    continue
+                try:
+                    ty = int(y_file.split(".")[0])
+                    bounds = get_tile_bounds(z, tx, ty)
+                    if overall_extent is None:
+                        overall_extent = [bounds[0], bounds[1], bounds[2], bounds[3]]
+                    else:
+                        overall_extent[0] = min(overall_extent[0], bounds[0])
+                        overall_extent[1] = min(overall_extent[1], bounds[1])
+                        overall_extent[2] = max(overall_extent[2], bounds[2])
+                        overall_extent[3] = max(overall_extent[3], bounds[3])
+                except ValueError:
+                    continue
+
+    if overall_extent:
+        return max_z, (
+            overall_extent[0],
+            overall_extent[1],
+            overall_extent[2],
+            overall_extent[3],
+        )
+    return max_z, None
+
+
+def generate_config(
     output_dir: str,
     title: str,
-    max_zoom: int,
     data_source: str,
     heights: str,
-    extent: Optional[Tuple[float, float, float, float]] = None,
 ) -> None:
-    """Generate the config.json for ATAK Map Source."""
+    """Generate the config.json for ATAK Map Source based on disk content."""
+    metadata_max_z, metadata_extent = get_rendered_metadata(output_dir)
+
     config: Dict[str, Any] = {
         "schema": "2.1.0",
         "title": title,
@@ -205,9 +258,9 @@ def generate_config(  # pylint: disable=too-many-arguments,too-many-positional-a
         "downloadable": True,
         "refreshInterval": 0,
         "isQuadtree": True,
-        "url": "{z}/{x}/{y}.png",
+        "url": "{$z}/{$x}/{$y}.png",
         "srs": "EPSG:4326",
-        "numLevels": max_zoom + 1,
+        "numLevels": metadata_max_z + 1,
         "tileMatrix": [
             {
                 "level": 0,
@@ -221,13 +274,13 @@ def generate_config(  # pylint: disable=too-many-arguments,too-many-positional-a
         "metadata": {"heights": heights, "dataSource": data_source},
     }
 
-    if extent:
+    if metadata_extent is not None:
         # extent: (min_lon, min_lat, max_lon, max_lat)
         config["bounds"] = {
-            "minLon": extent[0],
-            "minLat": extent[1],
-            "maxLon": extent[2],
-            "maxLat": extent[3],
+            "minLon": metadata_extent[0],
+            "minLat": metadata_extent[1],
+            "maxLon": metadata_extent[2],
+            "maxLat": metadata_extent[3],
         }
 
     with open(os.path.join(output_dir, "config.json"), "w", encoding="utf-8") as f:
@@ -253,6 +306,13 @@ def main() -> None:
     parser.add_argument(
         "--workers", type=int, help="Number of worker processes (default: CPU count)"
     )
+    parser.add_argument(
+        "--compression",
+        type=int,
+        choices=range(0, 10),
+        default=6,
+        help="PNG compression level (0-9)",
+    )
 
     args = parser.parse_args()
 
@@ -266,6 +326,7 @@ def main() -> None:
             "heights_type": heights_type,
             "data_source": args.data_source,
             "skip_existing": args.skip_existing,
+            "compression": args.compression,
         }
 
         cpu_count = os.cpu_count() or 1
@@ -294,9 +355,7 @@ def main() -> None:
                 if count > 0:
                     logger.info("Level %d: Generated %d tiles", z, count)
 
-        generate_config(
-            args.output, args.title, args.max_zoom, args.data_source, args.heights, extent
-        )
+        generate_config(args.output, args.title, args.data_source, args.heights)
         logger.info("Done!")
 
     except (RuntimeError, ValueError) as e:
