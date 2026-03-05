@@ -20,6 +20,7 @@ import logging
 import argparse
 import io
 import multiprocessing
+from dataclasses import dataclass
 from typing import Tuple, Dict, Any, Optional
 import numpy as np
 from osgeo import gdal
@@ -39,6 +40,18 @@ TILE_SIZE = 256
 
 # Global for worker processes
 _worker_ds: Optional[gdal.Dataset] = None
+
+
+@dataclass
+class ConfigParams:
+    """Parameters for generate_config."""
+
+    output_dir: str
+    title: str
+    data_source: str
+    heights: str
+    max_z: Optional[int] = None
+    extent: Optional[Tuple[float, float, float, float]] = None
 
 
 def get_vrt(input_path: str) -> gdal.Dataset:
@@ -209,6 +222,10 @@ def get_rendered_metadata(
         z = int(z_str)
         max_z = max(max_z, z)
 
+        # Skip Zoom 0 for extent calculation as it always covers the whole world
+        if z == 0:
+            continue
+
         z_dir = os.path.join(output_dir, z_str)
         for x_str in os.listdir(z_dir):
             if not x_str.isdigit():
@@ -241,18 +258,21 @@ def get_rendered_metadata(
     return max_z, None
 
 
-def generate_config(
-    output_dir: str,
-    title: str,
-    data_source: str,
-    heights: str,
-) -> None:
-    """Generate the config.json for ATAK Map Source based on disk content."""
-    metadata_max_z, metadata_extent = get_rendered_metadata(output_dir)
+def generate_config(params: ConfigParams) -> None:
+    """Generate the config.json for ATAK Map Source."""
+    max_z = params.max_z
+    extent = params.extent
+
+    if max_z is None or extent is None:
+        metadata_max_z, metadata_extent = get_rendered_metadata(params.output_dir)
+        if max_z is None:
+            max_z = metadata_max_z
+        if extent is None:
+            extent = metadata_extent
 
     config: Dict[str, Any] = {
         "schema": "2.1.0",
-        "title": title,
+        "title": params.title,
         "content": "terrain",
         "mimeType": "application/vnd.mapbox-terrain-rgb",
         "downloadable": True,
@@ -260,7 +280,7 @@ def generate_config(
         "isQuadtree": True,
         "url": "{$z}/{$x}/{$y}.png",
         "srs": "EPSG:4326",
-        "numLevels": metadata_max_z + 1,
+        "numLevels": max_z + 1,
         "tileMatrix": [
             {
                 "level": 0,
@@ -271,19 +291,19 @@ def generate_config(
                 "resolution": 156543.034,
             }
         ],
-        "metadata": {"heights": heights, "dataSource": data_source},
+        "metadata": {"heights": params.heights, "dataSource": params.data_source},
     }
 
-    if metadata_extent is not None:
+    if extent is not None:
         # extent: (min_lon, min_lat, max_lon, max_lat)
         config["bounds"] = {
-            "minLon": metadata_extent[0],
-            "minLat": metadata_extent[1],
-            "maxLon": metadata_extent[2],
-            "maxLat": metadata_extent[3],
+            "minLon": extent[0],
+            "minLat": extent[1],
+            "maxLon": extent[2],
+            "maxLat": extent[3],
         }
 
-    with open(os.path.join(output_dir, "config.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(params.output_dir, "config.json"), "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
 
 
@@ -355,7 +375,15 @@ def main() -> None:
                 if count > 0:
                     logger.info("Level %d: Generated %d tiles", z, count)
 
-        generate_config(args.output, args.title, args.data_source, args.heights)
+        config_params = ConfigParams(
+            output_dir=args.output,
+            title=args.title,
+            data_source=args.data_source,
+            heights=args.heights,
+            max_z=args.max_zoom,
+            extent=extent,
+        )
+        generate_config(config_params)
         logger.info("Done!")
 
     except (RuntimeError, ValueError) as e:
