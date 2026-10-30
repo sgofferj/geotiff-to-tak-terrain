@@ -26,6 +26,7 @@ build/
 .vscode/
 .idea/
 todo.md
+AGENTS.md
 
 # Logs
 *.log
