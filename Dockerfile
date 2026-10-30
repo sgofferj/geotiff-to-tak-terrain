@@ -1,35 +1,21 @@
-FROM python:3.10-slim
+FROM ghcr.io/osgeo/gdal:ubuntu-small-3.11.4
 
-# Install GDAL dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgdal-dev \
-    python3-dev \
-    g++ \
-    && rm -rf /var/lib/apt/lists/*
-
-# Set GDAL environment variables
-ENV CPLUS_INCLUDE_PATH=/usr/include/gdal
-ENV C_INCLUDE_PATH=/usr/include/gdal
-
-# Install Poetry
-RUN pip install --no-cache-dir poetry
+# Enable pip (the GDAL image ships without it) and install Poetry
+RUN apt-get update && apt-get install -y --no-install-recommends python3-pip \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --break-system-packages --no-cache-dir poetry
 
 WORKDIR /app
 
 # Copy project files
-COPY pyproject.toml README.md ./
+COPY pyproject.toml README.md poetry.lock ./
 
-# Install numpy and GDAL bindings matching the system version
-RUN pip install numpy==1.26.0 && \
-    GDAL_VERSION=$(gdal-config --version) && \
-    pip install GDAL==$GDAL_VERSION
-
-# Install remaining dependencies via poetry
+# Install remaining dependencies via poetry (GDAL and numpy come from the base image)
 RUN poetry config virtualenvs.create false \
     && poetry install --no-interaction --no-ansi --only main --no-root
 
 COPY src/ ./src/
-RUN pip install .
+RUN pip install --break-system-packages --no-cache-dir .
 
 # Set entrypoint
 ENTRYPOINT ["geotiff-to-tak-terrain"]
