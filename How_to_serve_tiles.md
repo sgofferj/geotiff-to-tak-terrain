@@ -17,6 +17,10 @@ ATAK natively supports two main streaming terrain formats through its "Streaming
 *   **Encoding**: 8-bit RGBA PNG. Elevation is packed into RGB:
     `height = -10000 + ((R * 65536 + G * 256 + B) * 0.1)`
 *   **Secret Sauce**: ATAK looks for a custom PNG chunk called `tAKa`. It contains a tiny JSON string with metadata like the SRID and tile index.
+*   **Heights**: ATAK expects heights above the ellipsoid (HAE). If your DEM is in N2000/MSL,
+    generate the tiles with vertical-datum conversion enabled (default: input auto-detected,
+    output HAE) — otherwise the terrain will sit low by the local geoid undulation
+    (≈ −19 m at sea level around Helsinki for N2000 input).
 *   **Tiling**: Usually follows the **Slippy/Google** scheme (Y=0 is at the North Pole). For `EPSG:4326`, Level 0 consists of **two** tiles (X=0 for West, X=1 for East).
 
 ---

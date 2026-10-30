@@ -25,7 +25,6 @@ build/
 # IDE
 .vscode/
 .idea/
-GEMINI.md
 todo.md
 
 # Logs

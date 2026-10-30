@@ -1,5 +1,14 @@
 # GeoTIFF to TAK LCLL Terrain Converter
 
+> [!WARNING]
+> Versions before vertical-datum support wrote input elevations straight into the tiles and only
+> set the `heights` metadata flag — the vertical datum was **never converted**. ATAK expects
+> heights above the ellipsoid (HAE), so tiles generated from orthometric/normal-height DEMs
+> (e.g. Finnish MML data in N2000) are off by the local geoid undulation (about **−19 m at sea
+> level around Helsinki**). If your source DEM is not already HAE, **regenerate your tiles**
+> with a version that includes the `--input-datum` fix (input datum is now auto-detected and
+> converted to HAE via the matching geoid grid).
+
 Convert Digital Elevation Model (DEM) GeoTIFFs into the **LCLL (Low Complexity Low Latency)** terrain format used by TAK (ATAK, WinTAK).
 
 ## Format Details
@@ -54,8 +63,32 @@ poetry run geotiff-to-tak-terrain <input_path> <output_dir> [options]
 - `--min-zoom`: Minimum zoom level (default: 0).
 - `--max-zoom`: Maximum zoom level (default: 14).
 - `--data-source`: Data source name for metadata (default: Local DEM).
-- `--heights`: Height datum, either `hae` (default) or `msl`.
+- `--heights`: Output height datum, either `hae` (default, as ATAK expects HAE) or `msl`.
+- `--input-datum`: Vertical datum of the input DEM: `auto` (default), `hae`, `msl`, `n2000`, `n60`.
+  `auto` detects the datum from the embedded CRS (e.g. EPSG:3900 for N2000, EPSG:5773 for EGM96,
+  EPSG:4979 for ellipsoidal) or from naming hints such as `etrs-tm35fin-n2000`
+  (Finnish MML 2 m DEM carries a plain 2D EPSG:3067 CRS, so the path name is the evidence),
+  and falls back to `hae` (no conversion).
+- `--geoid-grid`: Geoid undulation grid (GeoTIFF, N in metres, h = H + N). If omitted, the matching
+  grid is auto-selected: FIN2023N2000 (`fi_nls_fin2023n2000.tif`) for N2000, EGM96 for MSL —
+  searched in local PROJ data dirs and `~/.cache/geotiff-to-tak-terrain/grids/`,
+  otherwise downloaded from `https://cdn.proj.org/`.
+- `--no-geoid-download`: Disable automatic geoid grid download.
+- `--vertical-offset`: Constant offset in metres (h = H + offset), used where the grid has no
+  coverage. Less accurate than a grid (undulation varies ~15–25 m across Finland).
 - `--workers`: Number of parallel worker processes (default: `min(8, CPU_COUNT // 2)`).
+
+### Vertical datum examples
+```bash
+# Finnish MML 2 m DEM (N2000) -> HAE for ATAK (auto-detects n2000, downloads FIN2023N2000 grid)
+/data/in /data/out --title "Finland MML"
+
+# Explicit input datum with your own grid
+/data/in /data/out --input-datum n2000 --geoid-grid /data/grids/fi_nls_fin2023n2000.tif
+
+# Crude constant shift (only if you know the local undulation)
+/data/in /data/out --input-datum n2000 --vertical-offset 19.0
+```
 
 ## Memory Usage and Performance
 Memory consumption varies significantly based on the zoom level and the number of workers:

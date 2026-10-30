@@ -29,6 +29,17 @@ import png  # pypng for custom chunk support
 from .tyler import get_tile_bounds, get_intersecting_tiles
 from .encoder import encode_terrain_rgb
 from .metadata import create_taka_chunk
+from .datum import (
+    INPUT_DATUM_CHOICES,
+    VerticalShift,
+    apply_vertical_shift,
+    detect_input_datum,
+    open_geoid_dataset,
+    resolve_geoid_grid,
+    resolve_shift,
+    sample_geoid,
+    validate_shift_inputs,
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -38,8 +49,11 @@ gdal.UseExceptions()
 
 TILE_SIZE = 256
 
-# Global for worker processes
+# Globals for worker processes
 _worker_ds: Optional[gdal.Dataset] = None
+_worker_geoid_ds: Optional[gdal.Dataset] = None
+_worker_shift: Optional[VerticalShift] = None
+_worker_vertical_offset: Optional[float] = None
 
 
 @dataclass
@@ -73,11 +87,21 @@ def get_vrt(input_path: str) -> gdal.Dataset:
     return gdal.Warp("", vrt_ds, format="VRT", dstSRS="EPSG:4326")
 
 
-def worker_init(input_path: str) -> None:
+def worker_init(
+    input_path: str,
+    input_datum: str = "hae",
+    output_datum: str = "hae",
+    geoid_grid: Optional[str] = None,
+    vertical_offset: Optional[float] = None,
+) -> None:
     """Initialize worker process by opening the GDAL dataset."""
-    global _worker_ds  # pylint: disable=global-statement
+    global _worker_ds, _worker_geoid_ds, _worker_shift  # pylint: disable=global-statement
+    global _worker_vertical_offset  # pylint: disable=global-statement
     gdal.UseExceptions()
     _worker_ds = get_vrt(input_path)
+    _worker_shift = resolve_shift(input_datum, output_datum)
+    _worker_vertical_offset = vertical_offset
+    _worker_geoid_ds = open_geoid_dataset(geoid_grid) if geoid_grid else None
 
 
 def worker_task(args: Tuple[int, int, int, str, Dict[str, Any]]) -> bool:
@@ -97,13 +121,23 @@ def worker_task(args: Tuple[int, int, int, str, Dict[str, Any]]) -> bool:
     return process_tile(_worker_ds, (z, tx, ty), dest_dir, meta_params)
 
 
-def process_tile(  # pylint: disable=too-many-branches,too-many-statements
+def process_tile(  # pylint: disable=too-many-branches,too-many-statements,too-many-arguments,too-many-positional-arguments
     ds: gdal.Dataset,
     tile_coord: Tuple[int, int, int],
     dest_dir: str,
-    meta_params: Dict[str, str],
+    meta_params: Dict[str, Any],
+    geoid_ds: Optional[gdal.Dataset] = None,
+    shift: Optional[VerticalShift] = None,
+    vertical_offset: Optional[float] = None,
 ) -> bool:
     """Extract DEM data, encode as Terrain-RGB PNG, and add tAKa chunk."""
+    # Fall back to worker globals when called from the process pool.
+    if geoid_ds is None:
+        geoid_ds = _worker_geoid_ds
+    if shift is None:
+        shift = _worker_shift
+    if vertical_offset is None:
+        vertical_offset = _worker_vertical_offset
     z, tx, ty = tile_coord
     bounds = get_tile_bounds(z, tx, ty)
     tile_dir = os.path.join(dest_dir, str(z), str(tx))
@@ -152,6 +186,16 @@ def process_tile(  # pylint: disable=too-many-branches,too-many-statements
                 mask = (data > nodata).astype(np.uint8) * 255
                 if np.max(mask) == 0 and z > 0:
                     return False
+
+                # Vertical datum conversion (e.g. N2000 -> HAE for ATAK).
+                if shift is not None and shift.direction != 0:
+                    valid = mask > 0
+                    if np.any(valid):
+                        data = np.asarray(data, dtype=np.float32)
+                        geoid_n = None
+                        if geoid_ds is not None:
+                            geoid_n = sample_geoid(geoid_ds, bounds, TILE_SIZE, TILE_SIZE)
+                        data = apply_vertical_shift(data, valid, shift, geoid_n, vertical_offset)
 
         # Encode RGB
         rgb = encode_terrain_rgb(data)
@@ -307,6 +351,55 @@ def generate_config(params: ConfigParams) -> None:
         json.dump(config, f, indent=2)
 
 
+def resolve_datum_conversion(args: argparse.Namespace) -> Tuple[str, Optional[str]]:
+    """Resolve input datum (with auto-detection) and geoid grid (with auto-select).
+
+    Returns (input_datum, geoid_grid_path-or-None). Nothing is hardcoded to a
+    single survey: the grid is chosen from a registry based on the detected
+    datum (FIN2023N2000 for N2000, EGM96 for MSL), local PROJ data, or the
+    PROJ CDN.
+    """
+    input_datum = args.input_datum
+    if input_datum == "auto":
+        input_datum, evidence = detect_input_datum(args.input)
+        logger.info("Auto-detected input datum: %s (%s)", input_datum, evidence)
+
+    shift = resolve_shift(input_datum, args.heights)
+    geoid_grid = args.geoid_grid
+    if shift.needs_grid and geoid_grid is None:
+        auto_grid = resolve_geoid_grid(
+            shift.input_datum if shift.direction == 1 else "msl",
+            None,
+            allow_download=not args.no_geoid_download,
+        )
+        if auto_grid is not None:
+            geoid_grid = auto_grid
+            logger.info("Auto-selected geoid grid: %s", geoid_grid)
+        elif args.vertical_offset is None:
+            validate_shift_inputs(shift, None, None)
+        else:
+            logger.warning(
+                "No geoid grid found; falling back to constant offset %s m",
+                args.vertical_offset,
+            )
+    else:
+        validate_shift_inputs(shift, geoid_grid, args.vertical_offset)
+    if shift.direction != 0:
+        logger.info(
+            "Vertical datum conversion: %s -> %s (%s)",
+            input_datum,
+            args.heights,
+            "geoid grid " + geoid_grid
+            if geoid_grid
+            else (
+                f"constant offset {args.vertical_offset} m"
+                if args.vertical_offset is not None
+                else "no grid/offset"
+            ),
+        )
+    return input_datum, geoid_grid
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="GeoTIFF to TAK LCLL Terrain Tiles")
     parser.add_argument("input", help="Input GeoTIFF or directory")
@@ -315,7 +408,38 @@ def main() -> None:
     parser.add_argument("--min-zoom", type=int, default=0, help="Min zoom level")
     parser.add_argument("--max-zoom", type=int, default=14, help="Max zoom level")
     parser.add_argument("--data-source", default="Local DEM", help="Data source name")
-    parser.add_argument("--heights", choices=["hae", "msl"], default="hae", help="Height datum")
+    parser.add_argument(
+        "--heights",
+        choices=["hae", "msl"],
+        default="hae",
+        help="Output height datum (default: hae, as ATAK expects HAE)",
+    )
+    parser.add_argument(
+        "--input-datum",
+        choices=list(INPUT_DATUM_CHOICES),
+        default="auto",
+        help="Vertical datum of the input DEM (default: auto-detect from embedded CRS "
+        "or naming hints such as etrs-tm35fin-n2000; falls back to hae).",
+    )
+    parser.add_argument(
+        "--geoid-grid",
+        default=None,
+        help="GeoTIFF with geoid undulation N in metres (h = H + N). If omitted, "
+        "the matching grid is auto-selected (e.g. FIN2023N2000 for N2000, EGM96 for MSL) "
+        "from local PROJ data or downloaded from https://cdn.proj.org/.",
+    )
+    parser.add_argument(
+        "--no-geoid-download",
+        action="store_true",
+        help="Disable automatic geoid grid download from the PROJ CDN.",
+    )
+    parser.add_argument(
+        "--vertical-offset",
+        type=float,
+        default=None,
+        help="Constant offset in metres added for datum conversion (h = H + offset). "
+        "Used where --geoid-grid has no coverage; less accurate than a grid.",
+    )
     parser.add_argument(
         "--skip-existing", action="store_true", default=True, help="Skip already existing tiles"
     )
@@ -339,6 +463,8 @@ def main() -> None:
     heights_type = "ellipsoidal" if args.heights == "hae" else "orthometric"
 
     try:
+        input_datum, geoid_grid = resolve_datum_conversion(args)
+
         _, extent = get_input_dataset(args.input)
         logger.info("Dataset extent (WGS84): %s", extent)
 
@@ -356,7 +482,13 @@ def main() -> None:
         with multiprocessing.Pool(
             processes=num_workers,
             initializer=worker_init,
-            initargs=(args.input,),
+            initargs=(
+                args.input,
+                input_datum,
+                args.heights,
+                geoid_grid,
+                args.vertical_offset,
+            ),
             maxtasksperchild=50,
         ) as pool:
             for z in range(args.min_zoom, args.max_zoom + 1):

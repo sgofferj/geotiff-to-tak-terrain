@@ -3,7 +3,9 @@
 This document provides a real-world performance benchmark for converting a large-scale regional DEM dataset into TAK-compatible LCLL terrain tiles.
 
 ## Dataset Overview
-- **Source Material:** Maanmittauslaitos (MML) 10m Elevation Model.
+- **Source Material:** Maanmittauslaitos (MML) 10m Elevation Model (N2000 normal heights —
+  with current versions auto-detected and converted to HAE via the FIN2023N2000 grid;
+  older versions wrote N2000 values straight into the tiles, ≈ −19 m off at sea level).
 - **Input Format:** 1,524 GeoTIFF files (Float32, approx. 17GB raw).
 - **Extent:** Southern to Northern Finland (approx. 15° to 33° E, 59° to 70° N).
 - **Zoom Levels:** 0 to 14.
